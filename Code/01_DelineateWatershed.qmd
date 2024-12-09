@@ -1,0 +1,286 @@
+---
+title: "Kings Creek Watershed"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+library(dataRetrieval)
+library(here)
+library(styler)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(ggpubr)
+library(ggthemes)
+library(ggpmisc)
+library(ggforce)
+library(ggrepel)
+library(Gmisc)
+library(patchwork)
+library(RColorBrewer)
+library(sf)
+library(terra)
+library(exactextractr)
+library(riverdist)
+library(whitebox)
+library(stars)
+library(mapview) # needs to be dev version:    remotes::install_github("r-spatial/mapview")
+library(rayshader)
+library(rgl)
+library(tmap)
+#library(raster)
+```
+
+```{r}
+#### Set paths
+datPath <- here("Data/")
+resultPath <- here("Results/")
+shpFiles <- here("Results/ShapeFiles/") #where to save final shape files, prob need to figure out how to make 1 geopackage for all this
+scratchDir <- paste0(tempdir(), "/")#path to temp dir
+dir.create(paste0(scratchDir, "basins"), showWarnings = F) #temp dir for intermediate DEMs, if it doesn't exist make dir
+demDir <-  here("Data/1mDEM")
+
+#### Set CRS UTM zone 14N (epsg: 26914)
+utm14N <- 26914
+```
+
+# Read in 1m DEMs and Mosaic
+
+```{r}
+# Read in DEMs and mosaic
+tilePath <- list.files(paste0(datPath, "1mDEM"), "*.IMG", full.names = T, recursive = T)
+knzDem <- sprc(lapply(tilePath, rast))
+knzDem <- mosaic(knzDem)
+
+knzBound <- st_read(paste0(datPath, "LTER/KNZBoundary.kml")) %>% 
+  st_transform(utm14N)
+
+## crop and mask
+knzDem <- crop(knzDem, knzBound, mask = F)
+#r3 <- mask(r2, SPDF)
+#knzDem <- mask(kingsDEM, knzBound)
+
+writeRaster(knzDem, paste0(scratchDir, "1mMosaic.tif"), overwrite = T)
+
+```
+
+# Gage Pour Point
+
+```{r}
+#| message: false
+#| include: false
+#### Set pour points
+#Get site info from NWIS, NWIS uses NAD83 (EPSG: 4269) for datum, we'll need to project this
+kingsGage <- readNWISsite("06879650")
+kingsGage <- kingsGage %>% 
+  dplyr::select(Lat = dec_lat_va, Lon = dec_long_va) %>% 
+  mutate(Name = "Kings Creek") %>% 
+  st_as_sf(coords = c("Lon", "Lat"), crs = st_crs(4269)) %>% 
+  st_transform(utm14N)
+
+
+#LTER Weirs
+weirs <- st_read(paste0(datPath, "LTER/Weirs.kmz")) %>% 
+  st_transform(utm14N) %>% 
+  dplyr::select(Name, geometry)
+
+#SFM01 info
+sfm01 <- tibble(
+  Name = "SFM01",
+  x = 39.092281,
+  y = -96.587193) %>%
+  st_as_sf(., coords = c("y","x"), crs = 4326) %>%
+  st_transform(utm14N)
+
+pourPoints <- kingsGage %>% 
+  bind_rows(weirs) %>% 
+  bind_rows(sfm01) %>% 
+  rename(Watershed = Name)
+#Save pour point for later to use with whitebox
+st_write(pourPoints, paste0(scratchDir,"pourPoints.shp"), delete_dsn = T)
+```
+
+# Delineate Watershed
+
+```{r}
+#| warning: false
+# Process DEM
+#Smooth DEM
+wbt_gaussian_filter(
+  input = "1mMosaic.tif", 
+  output = "smoothed.tif",
+  wd = scratchDir)
+
+wbt_hillshade(dem = "smoothed.tif",
+              output = "hillshade.tif",
+              azimuth = 115,
+              wd = scratchDir)
+
+
+# #breach depressions, I could also fill depressions after this, but we're getting good results without
+# wbt_breach_depressions_least_cost(
+#   dem =    "KC_smoothed.tif",
+#   output = "KC_breached.tif",
+#   dist = 5,
+#   fill = T,
+#   wd = scratchDir)
+
+#breach depressions
+wbt_breach_depressions(
+  dem =    "smoothed.tif",
+  output = "breached.tif",
+  fill_pits = F,
+  wd = scratchDir)
+
+#Estimate slope
+wbt_slope(
+  dem ="breached.tif",
+  output = "slope.tif", 
+  wd = scratchDir
+)
+
+#Flow direction raster
+wbt_d8_pointer(
+  dem= "breached.tif",
+  output ="flowdir.tif",
+  wd = scratchDir
+)
+
+#Flow accumulation raster
+wbt_d8_flow_accumulation(
+  input = "breached.tif",
+#  out_type= "cells",
+  output = "flowacc.tif",
+  wd = scratchDir
+)
+
+#Create Stream Layer
+wbt_extract_streams(
+  flow_accum = "flowacc.tif",
+  output = "streams.tif",
+  threshold = 100000, #Threshhold in flow acc rast needed to make channel 
+  wd = scratchDir
+)
+
+wbt_strahler_stream_order(
+  d8_pntr = "flowdir.tif",
+  streams = "streams.tif",
+  output = "strahler.tif",
+  wd = scratchDir
+)
+
+#Snap pour point
+wbt_jenson_snap_pour_points(
+  pour_pts = "pourPoints.shp", 
+  streams = "streams.tif",
+  snap_dist = 10,
+  output =  "snap.shp",
+  wd = scratchDir)
+
+wbt_unnest_basins(
+  d8_pntr = "flowdir.tif",
+  pour_pts = "snap.shp", 
+  output = paste0(scratchDir, "basins/sheds.tif") ,
+  wd = scratchDir,
+)
+
+#Get a list of the watersheds created by `unnest_basins`
+sheds <- list.files(paste0(scratchDir, "basins/"), full.names=TRUE)
+
+#use stars package to transform raster watershed outlines into shapefiles
+shed_stacker <- function(x){
+  read_stars(sheds[x]) %>%
+    st_as_sf(merge=TRUE, use_integer=TRUE) %>%
+    rename(id=1) %>%
+    group_by(id) %>%
+    summarize()
+}
+
+# Use purrr::map to apply the raster-shapefile transformation to all rasters to a list of shapefiles 
+sheds <- purrr::map(1:length(sheds), shed_stacker)
+
+#Use do.call to bind these sf objects into a single one
+sheds <- do.call('rbind', sheds) %>% arrange(id)
+
+#Convert streams to vector
+wbt_raster_streams_to_vector(
+  streams = "streams.tif",
+  d8_pntr = "flowdir.tif",
+  output = "streams.shp",
+  wd = scratchDir
+)
+
+#Load stream vector
+streamNet <- st_read(file.path(scratchDir, "streams.shp"))
+st_crs(streamNet) <- st_crs(utm14N)
+
+
+#Add Names to watersheds
+sheds <- sheds %>% 
+  dplyr::select(-id) %>% 
+  mutate(Watershed = pourPoints$Watershed)
+ 
+#Crop streams to watershed
+streamNet <- streamNet[sheds,]
+# Add slope and contributing area to the stream network
+slope_raster <- rast(file.path(scratchDir, "slope.tif"))
+slope_raster <- crop(slope_raster, sheds)
+flow_acc_raster <- rast(file.path(scratchDir, "flowacc.tif"))
+flow_acc_raster <- crop(flow_acc_raster, sheds)
+strahler_raster <- rast(file.path(scratchDir, "strahler.tif"))
+strahler_raster <- crop(strahler_raster, sheds)
+
+
+streamNet <- streamNet %>%
+  mutate(
+    Slope = exact_extract(slope_raster, streamNet, "mean"),
+    FlowAcc = exact_extract(flow_acc_raster, streamNet, "mean"),
+    StrahlerOrder = exact_extract(strahler_raster, streamNet, "mean")
+  ) %>% 
+  st_zm() %>% 
+  mutate(
+    uid = seq(1, nrow(.)),
+    type = 'river')
+
+kingsNetwork <- line2network(sf = streamNet, autofix = F)
+kingsSites <- pointshp2segvert(path = scratchDir, layer = "snap", rivers = kingsNetwork) 
+distM <- riverdistancemat( seg = kingsSites$seg, vert = kingsSites$vert, rivers = kingsNetwork)
+distM <- distM[1,]
+
+siteElev <- terra::extract(knzDem, vect(pourPoints))
+
+
+#Save final shapefiles
+st_write(streamNet, paste0(shpFiles, "KingsCreekStreams.shp"), append = F)
+st_write(sheds, paste0(shpFiles, "KingsCreekWatersheds.shp"), append = F)
+pourPoints <- st_read(paste0(scratchDir, "snap.shp"))
+pourPoints <- pourPoints %>% 
+  left_join(sheds %>% 
+              mutate(SqKm = as.numeric(st_area(.)) / 1e6,
+                     SqMi = SqKm * 0.38610) %>%
+              st_drop_geometry() %>% 
+              dplyr::select(Watershed, SqKm, SqMi),
+            by = "Watershed") %>% 
+  mutate(distFromOutlet_km = distM * 0.001) %>% 
+  bind_cols(siteElev %>% dplyr::select(elev_m = Layer_1))
+
+st_write(pourPoints, paste0(shpFiles, "KingsCreek_Sites.shp"), append = F)
+
+```
+
+# Streams and Watersheds
+
+```{r}
+knz <- mapview(streamNet, color = "#0084a8") +
+  mapview(pourPoints, label = "Watershed") +
+  mapview(sheds, alpha.regions = 0.3)
+knz
+
+topologydots(kingsNetwork)
+```
