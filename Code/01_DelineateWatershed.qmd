@@ -7,45 +7,11 @@ editor: visual
 
 ```{r}
 #| include: false
-library(data.table)
-library(tidyverse, warn.conflicts = F)
-library(dataRetrieval)
 library(here)
-library(styler)
-library(scales)
-library(knitr)
-library(lubridate)
-library(zoo)
-library(ggpubr)
-library(ggthemes)
-library(ggpmisc)
-library(ggforce)
-library(ggrepel)
-library(Gmisc)
-library(patchwork)
-library(RColorBrewer)
-library(sf)
-library(terra)
-library(exactextractr)
-library(riverdist)
-library(whitebox)
-library(stars)
-library(mapview) # needs to be dev version:    remotes::install_github("r-spatial/mapview")
-library(rayshader)
-library(rgl)
-library(tmap)
-#library(raster)
+source(here("Code/paths+packages.R"))
 ```
 
 ```{r}
-#### Set paths
-datPath <- here("Data/")
-resultPath <- here("Results/")
-shpFiles <- here("Results/ShapeFiles/") #where to save final shape files, prob need to figure out how to make 1 geopackage for all this
-scratchDir <- paste0(tempdir(), "/")#path to temp dir
-dir.create(paste0(scratchDir, "basins"), showWarnings = F) #temp dir for intermediate DEMs, if it doesn't exist make dir
-demDir <-  here("Data/1mDEM")
-
 #### Set CRS UTM zone 14N (epsg: 26914)
 utm14N <- 26914
 ```
@@ -66,7 +32,7 @@ knzDem <- crop(knzDem, knzBound, mask = F)
 #r3 <- mask(r2, SPDF)
 #knzDem <- mask(kingsDEM, knzBound)
 
-writeRaster(knzDem, paste0(scratchDir, "1mMosaic.tif"), overwrite = T)
+writeRaster(knzDem, paste0(cacheDir, "1mMosaic.tif"), overwrite = T)
 
 ```
 
@@ -103,7 +69,7 @@ pourPoints <- kingsGage %>%
   bind_rows(sfm01) %>% 
   rename(Watershed = Name)
 #Save pour point for later to use with whitebox
-st_write(pourPoints, paste0(scratchDir,"pourPoints.shp"), delete_dsn = T)
+st_write(pourPoints, paste0(cacheDir,"pourPoints.shp"), delete_dsn = T)
 ```
 
 # Delineate Watershed
@@ -115,12 +81,12 @@ st_write(pourPoints, paste0(scratchDir,"pourPoints.shp"), delete_dsn = T)
 wbt_gaussian_filter(
   input = "1mMosaic.tif", 
   output = "smoothed.tif",
-  wd = scratchDir)
+  wd = cacheDir)
 
 wbt_hillshade(dem = "smoothed.tif",
               output = "hillshade.tif",
               azimuth = 115,
-              wd = scratchDir)
+              wd = cacheDir)
 
 
 # #breach depressions, I could also fill depressions after this, but we're getting good results without
@@ -129,27 +95,27 @@ wbt_hillshade(dem = "smoothed.tif",
 #   output = "KC_breached.tif",
 #   dist = 5,
 #   fill = T,
-#   wd = scratchDir)
+#   wd = cacheDir)
 
 #breach depressions
 wbt_breach_depressions(
   dem =    "smoothed.tif",
   output = "breached.tif",
   fill_pits = F,
-  wd = scratchDir)
+  wd = cacheDir)
 
 #Estimate slope
 wbt_slope(
   dem ="breached.tif",
   output = "slope.tif", 
-  wd = scratchDir
+  wd = cacheDir
 )
 
 #Flow direction raster
 wbt_d8_pointer(
   dem= "breached.tif",
   output ="flowdir.tif",
-  wd = scratchDir
+  wd = cacheDir
 )
 
 #Flow accumulation raster
@@ -157,7 +123,15 @@ wbt_d8_flow_accumulation(
   input = "breached.tif",
 #  out_type= "cells",
   output = "flowacc.tif",
-  wd = scratchDir
+  wd = cacheDir
+)
+
+# Calculate TWI
+wbt_wetness_index(
+  sca = "flowacc.tif",      
+  slope = "slope.tif",      
+  output = "twi.tif",
+  wd = cacheDir
 )
 
 #Create Stream Layer
@@ -165,14 +139,14 @@ wbt_extract_streams(
   flow_accum = "flowacc.tif",
   output = "streams.tif",
   threshold = 100000, #Threshhold in flow acc rast needed to make channel 
-  wd = scratchDir
+  wd = cacheDir
 )
 
 wbt_strahler_stream_order(
   d8_pntr = "flowdir.tif",
   streams = "streams.tif",
   output = "strahler.tif",
-  wd = scratchDir
+  wd = cacheDir
 )
 
 #Snap pour point
@@ -181,17 +155,17 @@ wbt_jenson_snap_pour_points(
   streams = "streams.tif",
   snap_dist = 10,
   output =  "snap.shp",
-  wd = scratchDir)
+  wd = cacheDir)
 
 wbt_unnest_basins(
   d8_pntr = "flowdir.tif",
   pour_pts = "snap.shp", 
-  output = paste0(scratchDir, "basins/sheds.tif") ,
-  wd = scratchDir,
+  output = paste0(cacheDir, "basins/sheds.tif") ,
+  wd = cacheDir,
 )
 
 #Get a list of the watersheds created by `unnest_basins`
-sheds <- list.files(paste0(scratchDir, "basins/"), full.names=TRUE)
+sheds <- list.files(paste0(cacheDir, "basins/"), full.names=TRUE)
 
 #use stars package to transform raster watershed outlines into shapefiles
 shed_stacker <- function(x){
@@ -213,11 +187,11 @@ wbt_raster_streams_to_vector(
   streams = "streams.tif",
   d8_pntr = "flowdir.tif",
   output = "streams.shp",
-  wd = scratchDir
+  wd = cacheDir
 )
 
 #Load stream vector
-streamNet <- st_read(file.path(scratchDir, "streams.shp"))
+streamNet <- st_read(file.path(cacheDir, "streams.shp"))
 st_crs(streamNet) <- st_crs(utm14N)
 
 
@@ -228,28 +202,36 @@ sheds <- sheds %>%
  
 #Crop streams to watershed
 streamNet <- streamNet[sheds,]
-# Add slope and contributing area to the stream network
-slope_raster <- rast(file.path(scratchDir, "slope.tif"))
+# Add slope, contributing area, and TWI to the stream network
+slope_raster <- rast(file.path(cacheDir, "slope.tif"))
 slope_raster <- crop(slope_raster, sheds)
-flow_acc_raster <- rast(file.path(scratchDir, "flowacc.tif"))
+flow_acc_raster <- rast(file.path(cacheDir, "flowacc.tif"))
 flow_acc_raster <- crop(flow_acc_raster, sheds)
-strahler_raster <- rast(file.path(scratchDir, "strahler.tif"))
+strahler_raster <- rast(file.path(cacheDir, "strahler.tif"))
 strahler_raster <- crop(strahler_raster, sheds)
-
+twi_raster <- rast(file.path(cacheDir, "twi.tif"))
+twi_raster <- crop(twi_raster, sheds)
 
 streamNet <- streamNet %>%
   mutate(
     Slope = exact_extract(slope_raster, streamNet, "mean"),
     FlowAcc = exact_extract(flow_acc_raster, streamNet, "mean"),
-    StrahlerOrder = exact_extract(strahler_raster, streamNet, "mean")
+    StrahlerOrder = exact_extract(strahler_raster, streamNet, "mean"),
+    TWI = exact_extract(twi_raster, streamNet, "mean")
   ) %>% 
   st_zm() %>% 
   mutate(
     uid = seq(1, nrow(.)),
     type = 'river')
 
+sheds <- sheds %>%
+  mutate(
+    Slope = exact_extract(slope_raster, sheds, "mean"),
+    TWI = exact_extract(twi_raster, sheds, "mean"),
+  )
+
 kingsNetwork <- line2network(sf = streamNet, autofix = F)
-kingsSites <- pointshp2segvert(path = scratchDir, layer = "snap", rivers = kingsNetwork) 
+kingsSites <- pointshp2segvert(path = cacheDir, layer = "snap", rivers = kingsNetwork) 
 distM <- riverdistancemat( seg = kingsSites$seg, vert = kingsSites$vert, rivers = kingsNetwork)
 distM <- distM[1,]
 
@@ -259,7 +241,7 @@ siteElev <- terra::extract(knzDem, vect(pourPoints))
 #Save final shapefiles
 st_write(streamNet, paste0(shpFiles, "KingsCreekStreams.shp"), append = F)
 st_write(sheds, paste0(shpFiles, "KingsCreekWatersheds.shp"), append = F)
-pourPoints <- st_read(paste0(scratchDir, "snap.shp"))
+pourPoints <- st_read(paste0(cacheDir, "snap.shp"))
 pourPoints <- pourPoints %>% 
   left_join(sheds %>% 
               mutate(SqKm = as.numeric(st_area(.)) / 1e6,

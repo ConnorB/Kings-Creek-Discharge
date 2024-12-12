@@ -1,0 +1,587 @@
+---
+title: "Untitled"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+source(here("Code/paths+packages.R"))
+
+col.cat.grn <- "#3cb44b"   # green
+col.cat.yel <- "#ffe119"   # yellow
+col.cat.org <- "#f58231"   # orange
+col.cat.red <- "#e6194b"   # red
+col.cat.blu <- "#0082c8"   # blue
+col.gray <- "gray65"       # gray for annotation lines, etc
+```
+
+# Load Data
+
+streamNet and streamSites shapefiles are from 01_DelineateWatershed.qmd
+
+```{r}
+#Stream Network
+streamNet <- read_sf(paste0(shpFiles, "KingsCreekStreams.shp"))
+#Stream Sites 
+streamSites <- read_sf(paste0(shpFiles, "KingsCreek_Sites.shp")) |> 
+  rename(Watershed = Watrshd, distFromOutlet_km = dstFrO_) |>
+  select(-SqMi)
+
+#### Discharge
+# LTER
+weirQ <- read_csv(here("Data/LTER/weirQ.csv")) |> 
+  filter(is.na(QualFlag) | QualFlag != 1)
+
+weirQ <- weirQ |> 
+  mutate(Q_Ls = Q_cms * 1000) |> 
+  mutate(Q_Ls = ifelse(Q_Ls > 2000, NA, Q_Ls),
+         Q_cms = ifelse(stageHeight_cm == 0 & Q_cms > 0, NA, Q_cms)) |> 
+  select(-Q_cms, -corrStageHeight_cm, -manualStage_cm, -LogFlag, -QualFlag)
+
+#Get discharge data from NWIS
+usgsQ <- loadNWIS(siteNo = c("06879650"),
+                  pCode = c("00060", "00065"),
+                  startDate = as_date(min(weirQ$dateTime)),
+                  endDate = as_date(max(weirQ$dateTime)),
+                  cacheDir = cacheDir)
+
+usgsQ <- usgsQ |>
+  mutate(Watershed = "Kings Creek")
+
+allQ <- weirQ |> 
+  full_join(usgsQ, by = c("dateTime", "Watershed", "Q_Ls", "stageHeight_cm"))
+
+dailyQ <- allQ |>
+  mutate(Date = as_date(dateTime)) |> # Extract the date component
+  group_by(Watershed, Date) |>       # Group by Watershed and date
+  summarise(Q_Ls = mean(Q_Ls, na.rm = TRUE),
+            stageHeight_cm = mean(stageHeight_cm, na.rm = TRUE), .groups = "drop") |> 
+  left_join(streamSites |> st_drop_geometry() |> select(Watershed, SqKm) , by = "Watershed")
+```
+
+## Calculate input from weirs
+
+```{r}
+# Calculate proportional contributions of upstream weirs
+dailyProportions <- dailyQ |>
+  filter(Watershed != "Kings Creek") |> 
+  group_by(Date) |> 
+  mutate(totalWeirQ = sum(Q_Ls, na.rm = TRUE),
+         Proportion = Q_Ls / totalWeirQ,
+         Proportion = replace_na(Proportion, 0)) |> 
+  ungroup()
+
+# Estimate lateral inflows (intervening areas)
+lateralInflow <- dailyQ |>
+  filter(Watershed == "Kings Creek") |>
+  left_join(dailyProportions |> filter(Watershed != "Kings Creek") |> 
+              group_by(Date) |> summarise(totalWeirQ = sum(Q_Ls, na.rm = TRUE)),
+            by = "Date") |>
+  mutate(LateralQ = Q_Ls - totalWeirQ)
+
+# Visualization of contributions
+dailyQ |> 
+ggplot(aes(x = Date, y = Q_Ls, color = Watershed)) +
+  geom_line() +
+  theme_few() +
+  labs(title = "Daily Discharge from Weirs and USGS Gage",
+       x = "Date", y = "Discharge (L/s)")
+
+ggplot(lateralInflow, aes(x = Date, y = LateralQ)) +
+  geom_line(color = "blue") +
+  theme_few() +
+  labs(title = "Estimated Lateral Inflows",
+       x = "Date", y = "Discharge (L/s)")
+
+# Define the watershed area contributing to the intermediate point
+intermediateSqKm <- streamSites |> st_drop_geometry() |> filter(Watershed == "SFM01") |> pull(SqKm)
+
+# Calculate lateral inflow between weirs and intermediate point
+lateralInflowIntermediate <- dailyQ |>
+  filter(Watershed == "Kings Creek") |>
+  left_join(dailyProportions |> 
+              filter(Watershed != "Kings Creek") |> 
+              group_by(Date) |> 
+              summarise(totalWeirQ = sum(Q_Ls, na.rm = TRUE)),
+            by = "Date") |>
+  mutate(LateralQ_intermediate = (Q_Ls - totalWeirQ) * (intermediateSqKm / SqKm)) |> 
+  select(Date, totalWeirQ, LateralQ_intermediate)
+
+# Estimate discharge at the intermediate point
+intermediateQ <- lateralInflowIntermediate |>
+  mutate(Q_intermediate = totalWeirQ + LateralQ_intermediate) |>
+  select(Date, Q_intermediate)
+
+# Visualize discharge at the intermediate point
+intermediateQ |> 
+  filter(Date > "2021-01-01") |> 
+ggplot(aes(x = Date, y = Q_intermediate)) +
+  geom_line(color = "darkgreen") +
+  theme_minimal() +
+  labs(title = "Estimated Discharge at Intermediate Point",
+       x = "Date", y = "Discharge (L/s)")
+
+```
+
+```{r}
+# # Prepare observed data for validation
+# observedQ <- dailyQ |>
+#   filter(Watershed != "Kings Creek") |> # Use weir data as observed
+#   rename(Q_observed = Q_Ls)
+# 
+# # Calculate predicted discharge using proportional contributions
+# predictedQ <- dailyProportions |>
+#   mutate(intermediateSqKm = SqKm) |>  # Use the weir SqKm as the intermediate watershed
+#   left_join(dailyQ |> filter(Watershed == "Kings Creek") |>
+#               select(Date, TotalDownstreamQ = Q_Ls), by = "Date") |>
+#   mutate(LateralQ_intermediate = (TotalDownstreamQ - totalWeirQ) * 
+#                                   (intermediateSqKm / 11.39595)) |> # Scale lateral inflow by weir's watershed area
+#   mutate(Q_predicted = totalWeirQ + LateralQ_intermediate) |>
+#   select(Watershed, Date, Q_predicted)
+# 
+# # Join observed and predicted for comparison
+# validation <- observedQ |>
+#   inner_join(predictedQ, by = c("Watershed", "Date"))
+# 
+# # Plot observed vs. predicted
+# ggplot(validation, aes(x = Q_observed, y = Q_predicted, color = Watershed)) +
+#   geom_point() +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+#   theme_minimal() +
+#   labs(title = "Observed vs Predicted Discharge",
+#        x = "Observed Discharge (L/s)",
+#        y = "Predicted Discharge (L/s)") +
+#   facet_wrap(~Watershed)
+# 
+# # Calculate model performance metrics
+# metrics <- validation |>
+#   group_by(Watershed) |>
+#   summarise(
+#     RMSE = sqrt(mean((Q_predicted - Q_observed)^2, na.rm = TRUE)),
+#     MAE = mean(abs(Q_predicted - Q_observed), na.rm = TRUE),
+#     R2 = cor(Q_predicted, Q_observed, use = "complete.obs")^2
+#   )
+# 
+# # Print performance metrics
+# print(metrics)
+```
+
+```{r}
+# n_of_Q <- function(Q, a = 1, b = 0.2, c = 1) {
+#   # Ensures Q + c > 0
+#   Q_adj <- ifelse(Q + c > 0, Q + c, 1) 
+#   a + b * log(Q_adj)
+# }
+# 
+# # Now incorporate n(Q) into the lateral inflow calculation for the intermediate point
+# lateralInflowIntermediate <- dailyQ |>
+#   filter(Watershed == "Kings Creek") |>
+#   left_join(dailyProportions |> 
+#               filter(Watershed != "Kings Creek") |> 
+#               group_by(Date) |> 
+#               summarise(totalWeirQ = sum(Q_Ls, na.rm = TRUE)),
+#             by = "Date") |>
+#   # Apply the n(Q) function to the ratio of intermediate area to reference area
+#   mutate(n_val = n_of_Q(Q_Ls),  # Compute n(Q) for the given Q_Ls
+#          LateralQ_intermediate = (Q_Ls - totalWeirQ) * ((intermediateSqKm / SqKm) ^ n_val)) |>
+#   select(Date, totalWeirQ, LateralQ_intermediate)
+# 
+# # Estimate discharge at the intermediate point using the non-linear scaling
+# intermediateQ <- lateralInflowIntermediate |>
+#   mutate(Q_intermediate = totalWeirQ + LateralQ_intermediate) |>
+#   select(Date, Q_intermediate)
+# 
+# # Visualize updated discharge at the intermediate point
+# intermediateQ |> 
+#   filter(Date > "2021-01-01") |> 
+#   ggplot(aes(x = Date, y = Q_intermediate)) +
+#   geom_line(color = "darkgreen") +
+#   theme_minimal() +
+#   labs(title = "Estimated Discharge at Intermediate Point with Non-Linear Scaling",
+#        x = "Date", y = "Discharge (L/s)")
+
+```
+
+```{r}
+# # Prepare observed data for validation
+# observedQ <- dailyQ |>
+#   filter(Watershed != "Kings Creek") |> # Use weir data as observed
+#   rename(Q_observed = Q_Ls)
+# 
+# # Calculate predicted discharge using proportional contributions and non-linear scaling
+# predictedQ <- dailyProportions |>
+#   mutate(intermediateSqKm = SqKm) |>  # Use weir SqKm as the intermediate watershed
+#   left_join(
+#     dailyQ |> 
+#       filter(Watershed == "Kings Creek") |>
+#       select(Date, TotalDownstreamQ = Q_Ls),
+#     by = "Date"
+#   ) |>
+#   # Incorporate n(Q) scaling on the area ratio
+#   mutate(n_val = n_of_Q(TotalDownstreamQ)) |>
+#   mutate(LateralQ_intermediate = (TotalDownstreamQ - totalWeirQ) * 
+#                                   ((intermediateSqKm / 11.39595) ^ n_val)) |>
+#   mutate(Q_predicted = totalWeirQ + LateralQ_intermediate) |>
+#   select(Watershed, Date, Q_predicted)
+# 
+# # Join observed and predicted for comparison
+# validation <- observedQ |>
+#   inner_join(predictedQ, by = c("Watershed", "Date"))
+# 
+# # Plot observed vs. predicted
+# ggplot(validation, aes(x = Q_observed, y = Q_predicted, color = Watershed)) +
+#   geom_point() +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+#   theme_minimal() +
+#   labs(title = "Observed vs Predicted Discharge with Non-Linear Scaling",
+#        x = "Observed Discharge (L/s)",
+#        y = "Predicted Discharge (L/s)") +
+#   facet_wrap(~Watershed)
+# 
+# # Calculate model performance metrics
+# metrics <- validation |>
+#   group_by(Watershed) |>
+#   summarise(
+#     RMSE = sqrt(mean((Q_predicted - Q_observed)^2, na.rm = TRUE)),
+#     MAE = mean(abs(Q_predicted - Q_observed), na.rm = TRUE),
+#     R2 = cor(Q_predicted, Q_observed, use = "complete.obs")^2
+#   )
+# 
+# # Print performance metrics
+# print(metrics)
+```
+
+```{r}
+# # Define the n_of_Q function with parameterization
+# n_of_Q <- function(Q, a, b, c) {
+#   Q_adj <- ifelse(Q + c > 0, Q + c, 1)
+#   a + b * log(Q_adj)
+# }
+# 
+# # Prepare observed data for validation
+# observedQ <- dailyQ |>
+#   filter(Watershed != "Kings Creek") |> # Use weir data as observed
+#   rename(Q_observed = Q_Ls)
+# 
+# # Define a function that calculates RMSE for given parameters a,b,c
+# rmse_for_params <- function(par) {
+#   a <- par[1]
+#   b <- par[2]
+#   c <- par[3]
+# 
+#   # Calculate predicted discharge using proportional contributions and non-linear scaling
+#   predictedQ <- dailyProportions |>
+#     mutate(intermediateSqKm = SqKm) |>  # Use weir SqKm as the intermediate watershed
+#     left_join(
+#       dailyQ |> 
+#         filter(Watershed == "Kings Creek") |>
+#         select(Date, TotalDownstreamQ = Q_Ls),
+#       by = "Date"
+#     ) |>
+#     mutate(n_val = n_of_Q(TotalDownstreamQ, a, b, c)) |>
+#     mutate(LateralQ_intermediate = (TotalDownstreamQ - totalWeirQ) *
+#                                    ((intermediateSqKm / 11.39595) ^ n_val)) |>
+#     mutate(Q_predicted = totalWeirQ + LateralQ_intermediate) |>
+#     select(Watershed, Date, Q_predicted)
+#   
+#   # Join observed and predicted for comparison
+#   validation <- observedQ |>
+#     inner_join(predictedQ, by = c("Watershed", "Date"))
+#   
+#   # Compute RMSE
+#   rmse_val <- sqrt(mean((validation$Q_predicted - validation$Q_observed)^2, na.rm = TRUE))
+#   
+#   return(rmse_val)
+# }
+# 
+# # Initial guesses for a, b, c
+# init_par <- c(a = 1, b = 0.2, c = 1)
+# 
+# # Use optim to minimize RMSE
+# # You can specify method and bounds if desired. Without bounds, "BFGS" is often a good start.
+# opt_results <- optim(par = init_par, fn = rmse_for_params, method = "BFGS")
+# 
+# # Print the optimal parameters and corresponding RMSE
+# opt_results
+# 
+# # Extract best-fit parameters from opt_results
+# best_a <- opt_results$par[1]
+# best_b <- opt_results$par[2]
+# best_c <- opt_results$par[3]
+# 
+# # Recalculate predictedQ and validation using the optimized parameters
+# predictedQ <- dailyProportions |>
+#   mutate(intermediateSqKm = SqKm) |>  
+#   left_join(
+#     dailyQ |> 
+#       filter(Watershed == "Kings Creek") |>
+#       select(Date, TotalDownstreamQ = Q_Ls),
+#     by = "Date"
+#   ) |>
+#   # Use the optimized n_of_Q parameters
+#   mutate(n_val = n_of_Q(TotalDownstreamQ, a = best_a, b = best_b, c = best_c)) |>
+#   mutate(LateralQ_intermediate = (TotalDownstreamQ - totalWeirQ) * 
+#                                   ((intermediateSqKm / 11.39595) ^ n_val)) |>
+#   mutate(Q_predicted = totalWeirQ + LateralQ_intermediate) |>
+#   select(Watershed, Date, Q_predicted)
+# 
+# validation <- observedQ |>
+#   inner_join(predictedQ, by = c("Watershed", "Date"))
+# 
+# # Plot observed vs. predicted with optimized parameters
+# ggplot(validation, aes(x = Q_observed, y = Q_predicted, color = Watershed)) +
+#   geom_point() +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+#   theme_minimal() +
+#   labs(title = "Observed vs Predicted Discharge with Optimized Non-Linear Scaling",
+#        x = "Observed Discharge (L/s)",
+#        y = "Predicted Discharge (L/s)") +
+#   facet_wrap(~Watershed)
+# 
+# # Recalculate performance metrics with optimized parameters
+# metrics <- validation |>
+#   group_by(Watershed) |>
+#   summarise(
+#     RMSE = sqrt(mean((Q_predicted - Q_observed)^2, na.rm = TRUE)),
+#     MAE = mean(abs(Q_predicted - Q_observed), na.rm = TRUE),
+#     R2 = cor(Q_predicted, Q_observed, use = "complete.obs")^2
+#   )
+# 
+# print(metrics)
+
+```
+
+```{r}
+#Stream Sites 
+streamSites <- read_sf(paste0(shpFiles, "KingsCreek_Sites.shp")) |> 
+  rename(Watershed = Watrshd, distFromOutlet_km = dstFrO_) |>
+  select(-SqMi) |> 
+  filter(Watershed != c("Kings Creek"))
+
+allQ <- weirQ 
+
+# Filter ungaged and gaged sites
+ungagedSite <- streamSites |> filter(Watershed == "SFM01") 
+gagedSites <- streamSites |> filter(Watershed != "SFM01") 
+# Calculate geographic distance between ungaged and gaged sites
+geoSim <- st_distance(ungagedSite, gagedSites)
+geoSim <- as.numeric(geoSim)
+
+# Calculate similarity distance and weights
+siteWeights <- streamSites |>
+  filter(Watershed != "SFM01") |>  # Filter for gauged sites
+  mutate(
+    DrainageWeight = 1/ abs(SqKm - ungagedSite |> pull(SqKm)) ,  # Inverse distance as weight
+    GeoWeight = 1 / geoSim) |> 
+  mutate(
+    DrainageWeight = DrainageWeight / sum(DrainageWeight, na.rm = TRUE),  # Normalize weights
+    GeoWeight = GeoWeight / sum(GeoWeight, na.rm = TRUE)
+  ) |> 
+  st_drop_geometry()
+
+# Filter ungaged and gaged sites
+ungagedSite <- streamSites |> filter(Watershed == "SFM01") |> st_drop_geometry()
+gagedSites <- streamSites |> filter(Watershed != "SFM01") |> st_drop_geometry()
+
+# Define colors for the types
+custom_colors <- c(
+  "Geographical Distance Weighted" = col.cat.grn,
+  "Drainage Area Weighted" = col.cat.org)
+
+```
+
+```{r}
+
+# Join weights with discharge data
+qWeights <- allQ |> 
+  filter(Watershed %in% siteWeights$Watershed) |> 
+  left_join(siteWeights |> select(Watershed, DrainageWeight, GeoWeight), by = "Watershed") |> 
+  # Apply weight to Q_Ls
+  mutate(geoQ = Q_Ls * GeoWeight,
+         drainQ = Q_Ls * DrainageWeight)
+
+# Calculate weighted Q
+marQ <- qWeights |>
+  group_by(dateTime) |>
+  summarize(
+    geoQ = sum(geoQ, na.rm = T)/sum(GeoWeight),  
+    drainQ = sum(drainQ, na.rm = T)/sum(DrainageWeight)) |>
+  ungroup()
+
+
+marQ |> 
+  filter(dateTime > "2021-01-01") |> 
+  pivot_longer(
+    cols = c(geoQ, drainQ), 
+    names_to = "Q_type", 
+    values_to = "Q_value"
+  ) |> 
+  mutate(Q_type = case_when(
+    Q_type == "geoQ" ~ "Geographical Distance Weighted",
+    Q_type == "drainQ" ~ "Drainage Area Weighted"  )) |> 
+  ggplot(aes(x = dateTime, y = Q_value, color = Q_type)) +
+  geom_line() +
+  facet_wrap(~ Q_type, scales = "fixed") +
+  scale_color_manual(values = custom_colors) +
+  theme_few() +
+  labs(
+    title = "Estimated Discharge",
+    x = "Date",
+    y = "Discharge (L/s)",
+    color = "Discharge Type"
+  ) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# Filter the discharge data for gaged sites
+gagedDischarge <- allQ |> 
+  filter(!is.na(Q_Ls)) |> 
+  inner_join(gagedSites, by = "Watershed")
+
+# Calculate Flow Duration Curve (FDC) for each gauged site
+gagedFDC <- gagedDischarge |>
+  select(Watershed, dateTime, Q_Ls) |> 
+  group_by(Watershed) |>
+  arrange(desc(Q_Ls)) |>  # Sort in descending order
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = round((Rank / (n() + 1)),4)
+  )  |> 
+  ungroup() |> 
+  group_by(Watershed, ExceedanceProbability) |>
+  summarize(
+    Q_Ls = mean(Q_Ls, na.rm = TRUE)
+  ) |>
+  ungroup() |> 
+  left_join(siteWeights)
+
+# Estimate FDC at the ungauged site
+ungagedFDC <- gagedFDC |>
+  mutate(geoQ = Q_Ls * GeoWeight,
+         drainQ = Q_Ls * DrainageWeight) |>   # Weighted average using GeoWeight  # Weighted average using GeoWeight
+  group_by(ExceedanceProbability) |>
+  summarize(
+    geoQ = sum(geoQ, na.rm = TRUE)/sum(GeoWeight, na.rm = T), # Weighted average using GeoWeight
+    drainQ = sum(drainQ, na.rm = TRUE)/sum(DrainageWeight, na.rm = T),
+    nSites = n()
+  ) |>
+  mutate(Watershed = "SFM01")
+
+# Estimate Q at ungauged site using time steps of gauged data
+gagedDischarge <- gagedDischarge |>
+  group_by(Watershed) |>
+  arrange(desc(Q_Ls)) |>  # Sort in descending order
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability =  (Rank / (n() + 1))
+  ) |> 
+  group_by(dateTime) |> 
+  summarise(ExceedanceProbability = round(mean(ExceedanceProbability, na.rm = T),4)) |> 
+  ungroup()
+
+fdcQ <- gagedDischarge |>
+  # Use gauged data time steps
+  select(dateTime, ExceedanceProbability) |>
+  left_join(ungagedFDC, by = "ExceedanceProbability") #|>  # Match probabilities
+
+fdcQ |> 
+  filter(dateTime > "2022-01-01" & dateTime < "2023-01-01") |> 
+  pivot_longer(
+    cols = c(geoQ, drainQ), 
+    names_to = "Q_type", 
+    values_to = "Q_value"
+  ) |> 
+  mutate(Q_type = case_when(
+    Q_type == "geoQ" ~ "Geographical Distance Weighted",
+    Q_type == "drainQ" ~ "Drainage Area Weighted",
+  )) |> 
+  ggplot(aes(x = dateTime, y = Q_value, color = Q_type)) +
+  geom_point(size = 0.1) +
+  facet_wrap(~ Q_type, scales = "fixed") +
+  scale_color_manual(values = custom_colors) +
+  theme_few() +
+  labs(
+    title = "Estimated Discharge",
+    x = "Date",
+    y = "Discharge (L/s)",
+    color = "Discharge Type"
+  ) +
+  theme(legend.position = "bottom")
+
+fdcQ |> 
+  filter(dateTime > "2021-01-01") |> 
+  pivot_longer(
+    cols = c(geoQ, drainQ), 
+    names_to = "Q_type", 
+    values_to = "Q_value"
+  ) |> 
+  mutate(Q_type = case_when(
+    Q_type == "geoQ" ~ "Geographical Distance Weighted",
+    Q_type == "drainQ" ~ "Drainage Area Weighted"  )) |> 
+  ggplot(aes(x = dateTime, y = Q_value, color = Q_type)) +
+  geom_line() +
+  facet_wrap(~ Q_type, scales = "fixed") +
+  scale_color_manual(values = custom_colors) +
+  theme_few() +
+  labs(
+    title = "Estimated Discharge",
+    x = "Date",
+    y = "Discharge (L/s)",
+    color = "Discharge Type"
+  ) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# Merge marQ and fdcQ
+combinedQ <- marQ |> 
+  full_join(fdcQ |> select(dateTime, geoQ, drainQ), by = "dateTime") |>
+  rename(geoQ_fdc = geoQ.y, geoQ_mar = geoQ.x,
+         drainQ_fdc = drainQ.y, drainQ_mar = drainQ.x)
+
+combinedQ |> 
+  ggplot(aes(x = drainQ_mar, y = drainQ_fdc)) +
+  geom_point() +
+  theme_few() +
+  theme(legend.position = "bottom")
+
+
+# Reshape the combined data for plotting
+plotData <- combinedQ |> 
+  pivot_longer(
+    cols = c(geoQ_mar, geoQ_fdc, drainQ_mar, drainQ_fdc),
+    names_to = c("Q_type", "Source"),
+    names_pattern = "(.*)_(.*)",
+    values_to = "Q_value"
+  ) |> 
+  mutate(
+    Q_type = case_when(
+      Q_type == "geoQ" ~ "Geographical Distance Weighted",
+      Q_type == "drainQ" ~ "Drainage Area Weighted"
+    ),
+    Source = case_when(
+      Source == "mar" ~ "MAR Estimates",
+      Source == "fdc" ~ "FDC Estimates"
+    )
+  )
+
+plotData |> 
+  ggplot(aes(x = dateTime, y = Q_value, color = Source, group = Source)) +
+  geom_line() +
+  facet_wrap(~ Q_type, scales = "free_y") +
+  theme_few() +
+  labs(
+    title = "Comparison of MAR and FDC Discharge Estimates",
+    x = "Date",
+    y = "Discharge (L/s)",
+    color = "Source"
+  ) +
+  theme(legend.position = "bottom")
+
+```
